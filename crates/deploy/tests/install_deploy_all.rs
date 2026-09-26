@@ -321,3 +321,76 @@ fn install_adds_missing_nested_files_without_overwriting_existing_files() {
         "print('new')\n"
     );
 }
+
+#[test]
+fn install_rejects_flat_agent_names_that_alias_on_the_target_filesystem() {
+    let dirs = Dirs::new();
+    let root = dirs.path();
+    let target = root.join(".claude/agents");
+    std::fs::create_dir_all(&target).unwrap();
+
+    // Probe the actual target directory rather than assuming an OS-wide case rule.
+    let upper = target.join("Agent.md");
+    let lower = target.join("agent.md");
+    drop(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&upper)
+            .unwrap(),
+    );
+    let names_alias = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lower)
+    {
+        Ok(file) => {
+            drop(file);
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+        Err(error) => panic!("cannot probe target filename behavior: {error}"),
+    };
+    std::fs::remove_file(&upper).unwrap();
+    if !names_alias {
+        std::fs::remove_file(&lower).unwrap();
+    }
+
+    let existing = target.join("existing.md");
+    std::fs::write(&existing, "# User content\n").unwrap();
+    std::fs::write(
+        root.join("Skillfile"),
+        "local agent team agents/team\ninstall claude-code local\n",
+    )
+    .unwrap();
+    for (source, content) in [
+        ("backend/Agent.md", "# Backend\n"),
+        ("frontend/agent.md", "# Frontend\n"),
+    ] {
+        let path = root.join("agents/team").join(source);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    let result = cmd_install(root, &default_opts());
+
+    if names_alias {
+        assert!(
+            result.is_err(),
+            "aliased names must be rejected before install"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("backend/Agent.md"), "{error}");
+        assert!(error.contains("frontend/agent.md"), "{error}");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+    } else {
+        result.unwrap();
+        assert_eq!(std::fs::read_to_string(upper).unwrap(), "# Backend\n");
+        assert_eq!(std::fs::read_to_string(lower).unwrap(), "# Frontend\n");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 3);
+    }
+    assert_eq!(
+        std::fs::read_to_string(existing).unwrap(),
+        "# User content\n"
+    );
+}
