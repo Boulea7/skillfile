@@ -202,6 +202,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.FUNCTIONAL_TESTS_GITHUB_TOKEN }}
         run: cargo test --workspace
 
+      - name: Show target case-alias test result
+        run: cargo test -p skillfile-deploy --test install_deploy_all install_rejects_flat_agent_names_that_alias_on_the_target_filesystem -- --exact --nocapture
+
   test-windows:
     name: Tests (Windows)
     runs-on: windows-latest
@@ -228,6 +231,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.FUNCTIONAL_TESTS_GITHUB_TOKEN }}
         run: cargo test --workspace
+
+      - name: Show target case-alias test result
+        run: cargo test -p skillfile-deploy --test install_deploy_all install_rejects_flat_agent_names_that_alias_on_the_target_filesystem -- --exact --nocapture
 
   fuzz:
     name: Fuzz parse_manifest
