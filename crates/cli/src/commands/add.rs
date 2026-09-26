@@ -9,8 +9,8 @@ use skillfile_core::models::{
 };
 use skillfile_core::parser::{infer_name, parse_manifest, parse_owner_repo_ref, MANIFEST_NAME};
 use skillfile_deploy::install::{
-    capture_install_snapshot, install_entry_with_outcome, InstallOutcome, InstallSkipReason,
-    InstallSnapshot,
+    capture_install_snapshot, ensure_unique_flat_install_destinations, install_entry_with_outcome,
+    InstallOutcome, InstallSkipReason, InstallSnapshot,
 };
 use skillfile_sources::strategy::format_parts;
 use skillfile_sources::sync::{sync_entry, vendor_dir_for, SyncContext};
@@ -62,6 +62,7 @@ fn sync_and_install(
     };
     sync_entry(&client, entry, &mut sync_ctx)?;
     write_lock(ctx.repo_root, &sync_ctx.locked)?;
+    ensure_unique_flat_install_destinations(ctx.manifest, ctx.repo_root)?;
     ctx.rollback
         .capture_install_snapshot(&InstallSnapshotCapture {
             entry,
@@ -864,6 +865,33 @@ mod tests {
         let entry = entry_from_local("skill", "skills/foo.md", None);
         // Should succeed without install targets
         cmd_add(&entry, dir.path()).unwrap();
+    }
+
+    #[test]
+    fn add_rolls_back_when_agent_destination_collides_with_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = "install claude-code local\nlocal agent backend agents/backend\n";
+        write_manifest(dir.path(), manifest);
+        for entry in ["backend", "frontend"] {
+            let source = dir.path().join("agents").join(entry).join("agent.md");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(source, format!("# {entry}\n")).unwrap();
+        }
+        let installed = dir.path().join(".claude/agents/agent.md");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "# Existing\n").unwrap();
+        let entry = entry_from_local("agent", "agents/frontend", Some("frontend"));
+
+        let error = cmd_add(&entry, dir.path()).unwrap_err().to_string();
+
+        assert!(error.contains("backend:agent.md"), "{error}");
+        assert!(error.contains("frontend:agent.md"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(MANIFEST_NAME)).unwrap(),
+            manifest
+        );
+        assert!(!dir.path().join("Skillfile.lock").exists());
+        assert_eq!(std::fs::read_to_string(installed).unwrap(), "# Existing\n");
     }
 
     // --- format_line direct tests ---

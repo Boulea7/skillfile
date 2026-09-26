@@ -55,6 +55,13 @@ install  <platform>  <scope>
 
 Multiple install lines are allowed (one per platform+scope combination). Duplicate install targets produce a warning during validation.
 
+Agent directory entries use a flat layout for built-in and explicit targets: each Markdown file
+is deployed as `<target-dir>/<basename>.md`. Installation rejects files that map to an identical
+destination path within one target, including files from different entries, before changing installed
+files. During `install --update`, local edits are auto-pinned against the old cache before new
+content is fetched; a collision in newly fetched content restores the previous cache, lock file,
+and patches, and leaves installed files unchanged.
+
 ### Explicit Path Targets
 
 ```

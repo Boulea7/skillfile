@@ -232,6 +232,10 @@ The label (`openclaw` or `openclaw-agents` above) is only a name shown in comman
 | `skill` | `<path>/<name>/SKILL.md` for a single-file skill, or `<path>/<name>/...` for a directory skill |
 | `agent` | `<path>/<name>.md` |
 
+Agent directories deploy each Markdown file under its basename. If two files map to an identical
+destination path in one target, including files from different entries, installation reports the
+conflicting sources before changing the installed files. Rename a source file to resolve the collision.
+
 Relative paths are resolved from the repository root. `~` and paths beginning with `~/` use your home directory. Custom targets can be mixed with built-in `install` targets; matching entries are installed to every configured target that supports their entity type.
 
 `skillfile validate` rejects duplicate destinations for the same entity type. Install and read operations also refuse to traverse user-controlled symlinked path components so a declared target cannot escape through a symlink.

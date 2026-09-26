@@ -8,7 +8,8 @@ use skillfile_core::conflict::{read_conflict, write_conflict};
 use skillfile_core::error::SkillfileError;
 use skillfile_core::lock::{lock_key, read_lock};
 use skillfile_core::models::{
-    short_sha, ConflictState, Entry, InstallOptions, InstallTarget, Manifest,
+    short_sha, ConflictState, EntityType, Entry, InstallOptions, InstallTarget, Manifest,
+    SourceFields,
 };
 use skillfile_core::parser::{parse_manifest, MANIFEST_NAME};
 use skillfile_core::patch::{
@@ -822,6 +823,83 @@ fn ensure_safe_install_effect_paths(ctx: &InstallValidationCtx<'_>) -> Result<()
     Ok(())
 }
 
+fn ensure_unique_flat_target_destinations(
+    entries: &[Entry],
+    target: &InstallTarget,
+    repo_root: &Path,
+) -> Result<(), SkillfileError> {
+    let Ok(resolved) = ResolvedInstallTarget::from_target(target) else {
+        return Ok(()); // Unknown built-in targets are skipped during deployment.
+    };
+    let mut sources_by_destination: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+
+    for entry in entries {
+        if !resolved.supports(entry.entity_type)
+            || resolved.dir_mode(entry.entity_type) != Some(DirInstallMode::Flat)
+        {
+            continue;
+        }
+        let Some(source) = source_path(entry, repo_root) else {
+            continue;
+        };
+        ensure_no_symlink_components(&source)
+            .map_err(|error| install_failure(entry, target, &error.to_string()))?;
+        if !source.exists() {
+            continue;
+        }
+
+        let paths = if is_dir_entry(entry) || source.is_dir() {
+            flat_expected_paths(&source, &resolved.target_dir(entry.entity_type, repo_root))
+        } else {
+            let name = source
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            HashMap::from([(name, resolved.installed_path(entry, repo_root))])
+        };
+        for (relative, destination) in paths {
+            sources_by_destination
+                .entry(destination)
+                .or_default()
+                .push(format!("{}:{relative}", entry.name));
+        }
+    }
+
+    let collisions = sources_by_destination
+        .into_iter()
+        .filter_map(|(destination, mut sources)| {
+            if sources.len() < 2 {
+                return None;
+            }
+            sources.sort();
+            let basename = destination
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            Some(format!("{basename:?} from {sources:?}"))
+        })
+        .collect::<Vec<_>>();
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    Err(SkillfileError::Install(format!(
+        "failed to install to {target}: duplicate flat destination filename(s): {}",
+        collisions.join("; ")
+    )))
+}
+
+/// Check all entries for each target before deployment can change installed files.
+pub fn ensure_unique_flat_install_destinations(
+    manifest: &Manifest,
+    repo_root: &Path,
+) -> Result<(), SkillfileError> {
+    for target in &manifest.install_targets {
+        ensure_unique_flat_target_destinations(&manifest.entries, target, repo_root)?;
+    }
+    Ok(())
+}
+
 pub fn capture_install_snapshot(
     entry: &Entry,
     targets: &[InstallTarget],
@@ -1045,6 +1123,7 @@ pub fn install_entry_with_outcome(
         is_dir,
         opts,
     };
+    ensure_unique_flat_target_destinations(std::slice::from_ref(entry), target, ctx.repo_root)?;
     ensure_safe_install_effect_paths(&validation_ctx)?;
     let plan = build_install_plan(&validation_ctx);
     let snapshot = if opts.dry_run {
@@ -1179,6 +1258,8 @@ fn install_entry_or_conflict(
 fn deploy_all(manifest: &Manifest, ctx: &DeployCtx<'_>) -> Result<(), SkillfileError> {
     let mode = if ctx.opts.dry_run { " [dry-run]" } else { "" };
 
+    ensure_unique_flat_install_destinations(manifest, ctx.repo_root)?;
+
     for target in &manifest.install_targets {
         if matches!(target, InstallTarget::Platform { .. })
             && ResolvedInstallTarget::from_target(target).is_err()
@@ -1246,6 +1327,44 @@ fn auto_pin_all(manifest: &Manifest, repo_root: &Path) -> Result<(), SkillfileEr
     Ok(())
 }
 
+fn has_updatable_flat_agent_dir(manifest: &Manifest) -> bool {
+    let has_updatable_dir = manifest.entries.iter().any(|entry| {
+        if entry.entity_type != EntityType::Agent {
+            return false;
+        }
+        match &entry.source {
+            SourceFields::Github { path_in_repo, .. }
+            | SourceFields::Gitlab { path_in_repo, .. } => {
+                path_in_repo == "." || is_dir_entry(entry)
+            }
+            SourceFields::Local { .. } | SourceFields::Url { .. } => false,
+        }
+    });
+    has_updatable_dir
+        && manifest.install_targets.iter().any(|target| {
+            ResolvedInstallTarget::from_target(target).is_ok_and(|resolved| {
+                resolved.supports(EntityType::Agent)
+                    && resolved.dir_mode(EntityType::Agent) == Some(DirInstallMode::Flat)
+            })
+        })
+}
+
+fn capture_update_state(
+    manifest: &Manifest,
+    repo_root: &Path,
+) -> Result<InstallSnapshot, SkillfileError> {
+    // Sync can update every remote entry before a newly fetched agent collision is known.
+    let mut paths = vec![repo_root.join("Skillfile.lock"), patches_root(repo_root)];
+    paths.extend(
+        manifest
+            .entries
+            .iter()
+            .filter(|entry| !matches!(&entry.source, SourceFields::Local { .. }))
+            .map(|entry| vendor_dir_for(entry, repo_root)),
+    );
+    InstallSnapshot::capture(repo_root, paths)
+}
+
 fn print_first_install_hint(manifest: &Manifest) {
     let platforms: Vec<String> = manifest
         .install_targets
@@ -1263,6 +1382,23 @@ pub struct CmdInstallOpts<'a> {
 }
 
 pub fn cmd_install(repo_root: &Path, opts: &CmdInstallOpts<'_>) -> Result<(), SkillfileError> {
+    cmd_install_with_sync(repo_root, opts, || {
+        cmd_sync(&skillfile_sources::sync::SyncCmdOpts {
+            repo_root,
+            dry_run: opts.dry_run,
+            entry_filter: None,
+            update: opts.update,
+            // The install body already printed manifest warnings.
+            print_warnings: false,
+        })
+    })
+}
+
+fn cmd_install_with_sync(
+    repo_root: &Path,
+    opts: &CmdInstallOpts<'_>,
+    sync: impl FnOnce() -> Result<(), SkillfileError>,
+) -> Result<(), SkillfileError> {
     let manifest = load_manifest(repo_root, opts.extra_targets)?;
 
     check_preconditions(&manifest, repo_root)?;
@@ -1273,6 +1409,16 @@ pub fn cmd_install(repo_root: &Path, opts: &CmdInstallOpts<'_>) -> Result<(), Sk
 
     // Read old locked state before sync (used for SHA context in conflict messages).
     let old_locked = read_lock(repo_root).unwrap_or_default();
+
+    // Cached collisions are known before auto-pin; fetched sources need a second check.
+    ensure_unique_flat_install_destinations(&manifest, repo_root)?;
+
+    let update_snapshot = if opts.update && !opts.dry_run && has_updatable_flat_agent_dir(&manifest)
+    {
+        Some(capture_update_state(&manifest, repo_root)?)
+    } else {
+        None
+    };
 
     // Auto-pin local edits before re-fetching upstream (--update only).
     if opts.update && !opts.dry_run {
@@ -1285,14 +1431,21 @@ pub fn cmd_install(repo_root: &Path, opts: &CmdInstallOpts<'_>) -> Result<(), Sk
     }
 
     // Fetch any missing or stale entries.
-    let sync_result = cmd_sync(&skillfile_sources::sync::SyncCmdOpts {
-        repo_root,
-        dry_run: opts.dry_run,
-        entry_filter: None,
-        update: opts.update,
-        // load_manifest already printed these warnings above.
-        print_warnings: false,
-    });
+    let sync_result = sync();
+
+    if let Err(error) = ensure_unique_flat_install_destinations(&manifest, repo_root) {
+        let error = match sync_result {
+            Ok(()) => error,
+            Err(sync_error) => {
+                SkillfileError::Install(format!("{error}; sync also failed: {sync_error}"))
+            }
+        };
+        return Err(if let Some(snapshot) = &update_snapshot {
+            restore_on_install_error(snapshot, error)
+        } else {
+            error
+        });
+    }
 
     // Read new locked state (written by sync).
     let locked = read_lock(repo_root).unwrap_or_default();
@@ -1649,6 +1802,45 @@ mod tests {
         );
         // No "core-dev" directory should exist — flat mode
         assert!(!agents_dir.join("core-dev").exists());
+    }
+
+    #[test]
+    fn install_entry_rejects_flat_collision_before_replacing_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("agents/team");
+        for relative in ["backend/agent.md", "frontend/agent.md"] {
+            let path = source.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("# {relative}\n")).unwrap();
+        }
+        let installed = dir.path().join(".claude/agents/agent.md");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "# Existing\n").unwrap();
+        let entry = Entry {
+            entity_type: EntityType::Agent,
+            name: "team".into(),
+            source: SourceFields::Local {
+                path: "agents/team".into(),
+            },
+        };
+        let options = InstallOptions {
+            dry_run: false,
+            overwrite: true,
+        };
+
+        let error = install_entry_with_outcome(
+            &entry,
+            &make_target("claude-code", Scope::Local),
+            &InstallCtx {
+                repo_root: dir.path(),
+                opts: Some(&options),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("duplicate flat destination"), "{error}");
+        assert_eq!(std::fs::read_to_string(installed).unwrap(), "# Existing\n");
     }
 
     #[test]
@@ -3405,5 +3597,257 @@ mod tests {
             install_targets: vec![make_target("claude-code", Scope::Local)],
         };
         check_preconditions(&manifest, dir.path()).unwrap();
+    }
+
+    #[test]
+    fn newly_fetched_flat_collision_keeps_installed_edit_and_auto_pin_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = Entry {
+            entity_type: EntityType::Agent,
+            name: "team".into(),
+            source: SourceFields::Github {
+                owner_repo: "owner/repo".into(),
+                path_in_repo: "agents/team".into(),
+                ref_: "main".into(),
+            },
+        };
+        let manifest = Manifest {
+            entries: vec![entry.clone()],
+            install_targets: vec![make_target("claude-code", Scope::Local)],
+        };
+        let cache = dir.path().join(".skillfile/cache/agents/team");
+        std::fs::create_dir_all(cache.join("backend")).unwrap();
+        std::fs::write(cache.join("backend/agent.md"), "# Upstream\n").unwrap();
+        std::fs::write(cache.join(".meta"), r#"{"sha":"old-sha"}"#).unwrap();
+        let installed = dir.path().join(".claude/agents/agent.md");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "# Local edit\n").unwrap();
+        let locked = BTreeMap::from([(
+            "github/agent/team".to_string(),
+            LockEntry {
+                sha: "old-sha".into(),
+                raw_url: "https://example.invalid/team".into(),
+            },
+        )]);
+        write_lock_fixture(dir.path(), &locked);
+
+        auto_pin_all(&manifest, dir.path()).unwrap();
+        let patch_path = dir_patch_fixture_path(dir.path(), &entry, "backend/agent.md");
+        let patch = std::fs::read_to_string(&patch_path).unwrap();
+        assert!(patch.contains("+# Local edit\n"));
+
+        // A fetched revision adds a second source for the same flat destination.
+        std::fs::create_dir_all(cache.join("frontend")).unwrap();
+        std::fs::write(cache.join("frontend/agent.md"), "# New upstream\n").unwrap();
+        std::fs::write(cache.join(".meta"), r#"{"sha":"new-sha"}"#).unwrap();
+        let options = InstallOptions {
+            dry_run: false,
+            overwrite: true,
+        };
+        let error = deploy_all(
+            &manifest,
+            &DeployCtx {
+                repo_root: dir.path(),
+                opts: &options,
+                maps: LockMaps {
+                    locked: &locked,
+                    old_locked: &locked,
+                },
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("duplicate flat destination"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&installed).unwrap(),
+            "# Local edit\n"
+        );
+        assert_eq!(std::fs::read_to_string(patch_path).unwrap(), patch);
+        assert!(!dir.path().join(".skillfile/conflict").exists());
+    }
+
+    fn update_collision_lock(sha: &str) -> BTreeMap<String, LockEntry> {
+        ["github/agent/team", "github/skill/notes"]
+            .into_iter()
+            .map(|key| {
+                (
+                    key.to_string(),
+                    LockEntry {
+                        sha: sha.into(),
+                        raw_url: format!("https://example.invalid/{key}/{sha}"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn write_update_collision_fixture(root: &Path) {
+        std::fs::write(
+            root.join("Skillfile"),
+            "github agent team owner/repo agents/team\n\
+             github skill notes owner/repo skills/notes.md\n\
+             install claude-code local\n",
+        )
+        .unwrap();
+        for (relative, content) in [
+            (
+                ".skillfile/cache/agents/team/backend/agent.md",
+                "# Old upstream\n",
+            ),
+            (".skillfile/cache/agents/team/.meta", r#"{"sha":"old-sha"}"#),
+            (".skillfile/cache/skills/notes/notes.md", "# Old skill\n"),
+            (".claude/agents/agent.md", "# Local edit\n"),
+            (
+                ".skillfile/patches/agents/team/backend/agent.md.patch",
+                "old patch marker\n",
+            ),
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        write_lock_fixture(root, &update_collision_lock("old-sha"));
+    }
+
+    #[test]
+    fn update_newly_fetched_flat_collision_restores_cache_lock_and_patches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_update_collision_fixture(root);
+        let old_lock = std::fs::read(root.join("Skillfile.lock")).unwrap();
+        let cache = root.join(".skillfile/cache/agents/team");
+        let patch = root.join(".skillfile/patches/agents/team/backend/agent.md.patch");
+
+        let error = cmd_install_with_sync(
+            root,
+            &CmdInstallOpts {
+                dry_run: false,
+                update: true,
+                extra_targets: None,
+            },
+            || {
+                assert_ne!(
+                    std::fs::read_to_string(&patch).unwrap(),
+                    "old patch marker\n"
+                );
+                std::fs::write(cache.join("backend/agent.md"), "# New upstream\n").unwrap();
+                std::fs::create_dir_all(cache.join("frontend")).unwrap();
+                std::fs::write(cache.join("frontend/agent.md"), "# Duplicate\n").unwrap();
+                std::fs::write(cache.join(".meta"), r#"{"sha":"new-sha"}"#).unwrap();
+                std::fs::write(
+                    root.join(".skillfile/cache/skills/notes/notes.md"),
+                    "# New skill\n",
+                )
+                .unwrap();
+                write_lock_fixture(root, &update_collision_lock("new-sha"));
+                Ok(())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("duplicate flat destination"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/agents/agent.md")).unwrap(),
+            "# Local edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&patch).unwrap(),
+            "old patch marker\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("Skillfile.lock")).unwrap(),
+            old_lock
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.join(".meta")).unwrap(),
+            r#"{"sha":"old-sha"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.join("backend/agent.md")).unwrap(),
+            "# Old upstream\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".skillfile/cache/skills/notes/notes.md")).unwrap(),
+            "# Old skill\n"
+        );
+        assert!(!cache.join("frontend/agent.md").exists());
+        assert!(!root.join(".skillfile/conflict").exists());
+    }
+
+    #[test]
+    fn update_collision_also_reports_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_update_collision_fixture(root);
+        let old_lock = std::fs::read(root.join("Skillfile.lock")).unwrap();
+        let cache = root.join(".skillfile/cache/agents/team");
+        let patch = root.join(".skillfile/patches/agents/team/backend/agent.md.patch");
+
+        let error = cmd_install_with_sync(
+            root,
+            &CmdInstallOpts {
+                dry_run: false,
+                update: true,
+                extra_targets: None,
+            },
+            || {
+                std::fs::create_dir_all(cache.join("frontend")).unwrap();
+                std::fs::write(cache.join("frontend/agent.md"), "# Duplicate\n").unwrap();
+                write_lock_fixture(root, &update_collision_lock("new-sha"));
+                Err(SkillfileError::Network("HTTP 403 fetching notes".into()))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("duplicate flat destination"), "{error}");
+        assert!(error.contains("HTTP 403 fetching notes"), "{error}");
+        assert_eq!(
+            std::fs::read(root.join("Skillfile.lock")).unwrap(),
+            old_lock
+        );
+        assert_eq!(
+            std::fs::read_to_string(&patch).unwrap(),
+            "old patch marker\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/agents/agent.md")).unwrap(),
+            "# Local edit\n"
+        );
+        assert!(!cache.join("frontend/agent.md").exists());
+    }
+
+    #[test]
+    fn update_without_remote_flat_agent_skips_collision_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Skillfile"),
+            "local skill notes skills/notes.md\ninstall claude-code local\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("skills")).unwrap();
+        std::fs::write(root.join("skills/notes.md"), "# Notes\n").unwrap();
+
+        cmd_install_with_sync(
+            root,
+            &CmdInstallOpts {
+                dry_run: false,
+                update: true,
+                extra_targets: None,
+            },
+            || {
+                assert!(!root.join(".skillfile/tmp").exists());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/skills/notes/SKILL.md")).unwrap(),
+            "# Notes\n"
+        );
     }
 }
