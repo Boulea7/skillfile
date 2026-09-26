@@ -1,5 +1,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +28,7 @@ use crate::paths::source_path;
 use crate::target::ResolvedInstallTarget;
 
 static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static FLAT_NAME_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Patch application helpers
@@ -823,40 +826,326 @@ fn ensure_safe_install_effect_paths(ctx: &InstallValidationCtx<'_>) -> Result<()
     Ok(())
 }
 
-fn ensure_unique_flat_target_destinations(
-    entries: &[Entry],
+fn ensure_existing_safe_dir(path: &Path) -> io::Result<()> {
+    // The shared guard permits OS-managed top-level aliases such as macOS /var.
+    ensure_no_symlink_components(path)?;
+    if std::fs::metadata(path)?.is_dir() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{} is not a safe directory",
+            path.display()
+        )))
+    }
+}
+
+fn create_missing_target_dirs(target: &Path, created: &mut Vec<PathBuf>) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = target;
+    while !cursor.as_os_str().is_empty() {
+        match std::fs::symlink_metadata(cursor) {
+            Ok(_) => {
+                ensure_existing_safe_dir(cursor)?;
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| io::Error::other("target has no parent directory"))?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    for dir in missing.into_iter().rev() {
+        ensure_no_symlink_components(&dir)?;
+        match std::fs::create_dir(&dir) {
+            Ok(()) => created.push(dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                ensure_existing_safe_dir(&dir)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn probe_marker_visible(path: &Path, expected: &[u8]) -> io::Result<bool> {
+    match std::fs::read(path) {
+        Ok(actual) if actual == expected => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected validation marker at {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn reserve_flat_probe_stage(target: &Path) -> io::Result<(PathBuf, String)> {
+    for _ in 0..32 {
+        let counter = FLAT_NAME_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let name = format!(".skillfile-CaSe-{}-{nanos}-{counter}", std::process::id());
+        let stage = target.join(&name);
+        let Err(error) = std::fs::create_dir(&stage) else {
+            return Ok((stage, name));
+        };
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "cannot reserve a flat destination validation directory",
+    ))
+}
+
+fn record_probe_cleanup_error(path: &Path, result: io::Result<()>, errors: &mut Vec<String>) {
+    if let Err(error) = result {
+        if error.kind() != io::ErrorKind::NotFound {
+            errors.push(format!("{}: {error}", path.display()));
+        }
+    }
+}
+
+fn read_probe_source_index(path: &Path, current: usize) -> io::Result<usize> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected validation entry",
+        ));
+    }
+    let first = std::fs::read_to_string(path)?
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid validation source index"))?;
+    if first >= current {
+        return Err(io::Error::other("invalid validation source index"));
+    }
+    Ok(first)
+}
+
+fn describe_probe_collision(basename: &OsString, first: &str, second: &str) -> String {
+    let mut sources = [first.to_owned(), second.to_owned()];
+    sources.sort();
+    format!("{:?} from {sources:?}", basename.to_string_lossy())
+}
+
+struct FlatDestinationProbe<'a> {
+    target: &'a Path,
+    stage: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    created_dirs: Vec<PathBuf>,
+}
+
+impl Drop for FlatDestinationProbe<'_> {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+impl<'a> FlatDestinationProbe<'a> {
+    fn new(target: &'a Path) -> Self {
+        Self {
+            target,
+            stage: None,
+            files: Vec::new(),
+            created_dirs: Vec::new(),
+        }
+    }
+
+    fn prepare(&mut self) -> io::Result<()> {
+        ensure_no_symlink_components(self.target)?;
+        create_missing_target_dirs(self.target, &mut self.created_dirs)?;
+        let (stage, name) = reserve_flat_probe_stage(self.target)?;
+        self.stage = Some(stage);
+        self.calibrate(&name)
+    }
+
+    fn calibrate(&mut self, stage_name: &str) -> io::Result<()> {
+        let stage = self.stage.as_ref().expect("validation directory exists");
+        let marker_name = ".skillfile-MaRkEr";
+        let marker = stage.join(marker_name);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)?;
+        self.files.push(marker.clone());
+        file.write_all(stage_name.as_bytes())?;
+        drop(file);
+
+        // A direct child can inherit different case rules from its parent.
+        let parent_alias = self
+            .target
+            .join(stage_name.replacen("CaSe", "cAsE", 1))
+            .join(marker_name);
+        let parent_insensitive = probe_marker_visible(&parent_alias, stage_name.as_bytes())?;
+        let stage_insensitive =
+            probe_marker_visible(&stage.join(".skillfile-mArKeR"), stage_name.as_bytes())?;
+        if parent_insensitive != stage_insensitive {
+            return Err(io::Error::other(
+                "cannot reliably validate target directory filename behavior",
+            ));
+        }
+        std::fs::remove_file(&marker)?;
+        self.files.pop();
+        Ok(())
+    }
+
+    fn stage_name(&mut self, index: usize, basename: &OsString) -> io::Result<Option<usize>> {
+        let stage = self.stage.as_ref().expect("validation directory exists");
+        let path = stage.join(basename);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                self.files.push(path);
+                file.write_all(index.to_string().as_bytes())?;
+                Ok(None)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                read_probe_source_index(&path, index).map(Some)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn cleanup_stage(&self, errors: &mut Vec<String>) {
+        let Some(stage) = &self.stage else {
+            return;
+        };
+        if let Err(error) = ensure_no_symlink_components(stage) {
+            errors.push(format!("{}: {error}", stage.display()));
+            return;
+        }
+        for file in self.files.iter().rev() {
+            record_probe_cleanup_error(file, std::fs::remove_file(file), errors);
+        }
+        record_probe_cleanup_error(stage, std::fs::remove_dir(stage), errors);
+    }
+
+    fn cleanup_created_dirs(&self, errors: &mut Vec<String>) {
+        for dir in self.created_dirs.iter().rev() {
+            match ensure_no_symlink_components(dir) {
+                Ok(()) => record_probe_cleanup_error(dir, std::fs::remove_dir(dir), errors),
+                Err(error) => errors.push(format!("{}: {error}", dir.display())),
+            }
+        }
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        let mut errors = Vec::new();
+        self.cleanup_stage(&mut errors);
+        self.cleanup_created_dirs(&mut errors);
+        if errors.is_empty() {
+            self.stage = None;
+            self.files.clear();
+            self.created_dirs.clear();
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("; ")))
+        }
+    }
+}
+
+fn find_flat_probe_collision(
+    probe: &mut FlatDestinationProbe<'_>,
+    names: &[(OsString, String)],
+) -> io::Result<Option<String>> {
+    for (index, (basename, source)) in names.iter().enumerate() {
+        let Some(first) = probe.stage_name(index, basename)? else {
+            continue;
+        };
+        return Ok(Some(describe_probe_collision(
+            basename,
+            &names[first].1,
+            source,
+        )));
+    }
+    Ok(None)
+}
+
+fn validate_actual_flat_names(
     target: &InstallTarget,
-    repo_root: &Path,
+    target_dir: &Path,
+    names: &[(OsString, String)],
 ) -> Result<(), SkillfileError> {
-    let Ok(resolved) = ResolvedInstallTarget::from_target(target) else {
-        return Ok(()); // Unknown built-in targets are skipped during deployment.
+    let mut probe = FlatDestinationProbe::new(target_dir);
+    let outcome = probe
+        .prepare()
+        .and_then(|()| find_flat_probe_collision(&mut probe, names));
+    let cleanup = probe.cleanup();
+    let failure = match outcome {
+        Ok(Some(collision)) => Some(format!(
+            "failed to install to {target}: duplicate flat destination filename(s): {collision}"
+        )),
+        Ok(None) => None,
+        Err(error) => Some(format!(
+            "failed to install to {target}: cannot validate flat destinations in {}: {error}",
+            target_dir.display()
+        )),
+    };
+    match (failure, cleanup) {
+        (None, Ok(())) => Ok(()),
+        (Some(message), Ok(())) => Err(SkillfileError::Install(message)),
+        (None, Err(error)) => Err(SkillfileError::Install(format!(
+            "failed to install to {target}: validation cleanup failed: {error}"
+        ))),
+        (Some(message), Err(error)) => Err(SkillfileError::Install(format!(
+            "{message}; validation cleanup failed: {error}"
+        ))),
+    }
+}
+
+struct FlatValidationCtx<'a> {
+    entries: &'a [Entry],
+    target: &'a InstallTarget,
+    repo_root: &'a Path,
+    dry_run: bool,
+}
+
+fn collect_flat_destinations(
+    ctx: &FlatValidationCtx<'_>,
+) -> Result<BTreeMap<PathBuf, Vec<String>>, SkillfileError> {
+    let Ok(resolved) = ResolvedInstallTarget::from_target(ctx.target) else {
+        return Ok(BTreeMap::new()); // Unknown built-in targets are skipped.
     };
     let mut sources_by_destination: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
 
-    for entry in entries {
+    for entry in ctx.entries {
         if !resolved.supports(entry.entity_type)
             || resolved.dir_mode(entry.entity_type) != Some(DirInstallMode::Flat)
         {
             continue;
         }
-        let Some(source) = source_path(entry, repo_root) else {
+        let Some(source) = source_path(entry, ctx.repo_root) else {
             continue;
         };
         ensure_no_symlink_components(&source)
-            .map_err(|error| install_failure(entry, target, &error.to_string()))?;
+            .map_err(|error| install_failure(entry, ctx.target, &error.to_string()))?;
         if !source.exists() {
             continue;
         }
 
         let paths = if is_dir_entry(entry) || source.is_dir() {
-            flat_expected_paths(&source, &resolved.target_dir(entry.entity_type, repo_root))
+            flat_expected_paths(
+                &source,
+                &resolved.target_dir(entry.entity_type, ctx.repo_root),
+            )
         } else {
             let name = source
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            HashMap::from([(name, resolved.installed_path(entry, repo_root))])
+            HashMap::from([(name, resolved.installed_path(entry, ctx.repo_root))])
         };
         for (relative, destination) in paths {
             sources_by_destination
@@ -865,13 +1154,17 @@ fn ensure_unique_flat_target_destinations(
                 .push(format!("{}:{relative}", entry.name));
         }
     }
+    Ok(sources_by_destination)
+}
 
-    let collisions = sources_by_destination
-        .into_iter()
-        .filter_map(|(destination, mut sources)| {
+fn literal_flat_collisions(sources_by_destination: &BTreeMap<PathBuf, Vec<String>>) -> Vec<String> {
+    sources_by_destination
+        .iter()
+        .filter_map(|(destination, sources)| {
             if sources.len() < 2 {
                 return None;
             }
+            let mut sources = sources.clone();
             sources.sort();
             let basename = destination
                 .file_name()
@@ -879,23 +1172,66 @@ fn ensure_unique_flat_target_destinations(
                 .to_string_lossy();
             Some(format!("{basename:?} from {sources:?}"))
         })
-        .collect::<Vec<_>>();
-    if collisions.is_empty() {
+        .collect()
+}
+
+fn validate_actual_flat_groups(
+    target: &InstallTarget,
+    sources_by_destination: BTreeMap<PathBuf, Vec<String>>,
+) -> Result<(), SkillfileError> {
+    let mut names_by_target: BTreeMap<PathBuf, Vec<(OsString, String)>> = BTreeMap::new();
+    for (destination, sources) in sources_by_destination {
+        let Some((parent, basename)) = destination.parent().zip(destination.file_name()) else {
+            continue;
+        };
+        for source in sources {
+            names_by_target
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push((basename.to_os_string(), source));
+        }
+    }
+    for (target_dir, mut names) in names_by_target {
+        if names.len() < 2 {
+            continue;
+        }
+        names.sort();
+        validate_actual_flat_names(target, &target_dir, &names)?;
+    }
+    Ok(())
+}
+
+fn ensure_unique_flat_target_destinations(
+    ctx: &FlatValidationCtx<'_>,
+) -> Result<(), SkillfileError> {
+    let sources_by_destination = collect_flat_destinations(ctx)?;
+    let collisions = literal_flat_collisions(&sources_by_destination);
+    if !collisions.is_empty() {
+        return Err(SkillfileError::Install(format!(
+            "failed to install to {}: duplicate flat destination filename(s): {}",
+            ctx.target,
+            collisions.join("; ")
+        )));
+    }
+    if ctx.dry_run {
         return Ok(());
     }
-    Err(SkillfileError::Install(format!(
-        "failed to install to {target}: duplicate flat destination filename(s): {}",
-        collisions.join("; ")
-    )))
+    validate_actual_flat_groups(ctx.target, sources_by_destination)
 }
 
 /// Check all entries for each target before deployment can change installed files.
 pub fn ensure_unique_flat_install_destinations(
     manifest: &Manifest,
     repo_root: &Path,
+    dry_run: bool,
 ) -> Result<(), SkillfileError> {
     for target in &manifest.install_targets {
-        ensure_unique_flat_target_destinations(&manifest.entries, target, repo_root)?;
+        ensure_unique_flat_target_destinations(&FlatValidationCtx {
+            entries: &manifest.entries,
+            target,
+            repo_root,
+            dry_run,
+        })?;
     }
     Ok(())
 }
@@ -1123,7 +1459,12 @@ pub fn install_entry_with_outcome(
         is_dir,
         opts,
     };
-    ensure_unique_flat_target_destinations(std::slice::from_ref(entry), target, ctx.repo_root)?;
+    ensure_unique_flat_target_destinations(&FlatValidationCtx {
+        entries: std::slice::from_ref(entry),
+        target,
+        repo_root: ctx.repo_root,
+        dry_run: opts.dry_run,
+    })?;
     ensure_safe_install_effect_paths(&validation_ctx)?;
     let plan = build_install_plan(&validation_ctx);
     let snapshot = if opts.dry_run {
@@ -1258,7 +1599,7 @@ fn install_entry_or_conflict(
 fn deploy_all(manifest: &Manifest, ctx: &DeployCtx<'_>) -> Result<(), SkillfileError> {
     let mode = if ctx.opts.dry_run { " [dry-run]" } else { "" };
 
-    ensure_unique_flat_install_destinations(manifest, ctx.repo_root)?;
+    ensure_unique_flat_install_destinations(manifest, ctx.repo_root, ctx.opts.dry_run)?;
 
     for target in &manifest.install_targets {
         if matches!(target, InstallTarget::Platform { .. })
@@ -1411,7 +1752,7 @@ fn cmd_install_with_sync(
     let old_locked = read_lock(repo_root).unwrap_or_default();
 
     // Cached collisions are known before auto-pin; fetched sources need a second check.
-    ensure_unique_flat_install_destinations(&manifest, repo_root)?;
+    ensure_unique_flat_install_destinations(&manifest, repo_root, opts.dry_run)?;
 
     let update_snapshot = if opts.update && !opts.dry_run && has_updatable_flat_agent_dir(&manifest)
     {
@@ -1433,7 +1774,8 @@ fn cmd_install_with_sync(
     // Fetch any missing or stale entries.
     let sync_result = sync();
 
-    if let Err(error) = ensure_unique_flat_install_destinations(&manifest, repo_root) {
+    if let Err(error) = ensure_unique_flat_install_destinations(&manifest, repo_root, opts.dry_run)
+    {
         let error = match sync_result {
             Ok(()) => error,
             Err(sync_error) => {
@@ -1492,6 +1834,51 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+
+    fn target_aliases_case_names(target: &Path) -> bool {
+        let upper = target.join("Agent.md");
+        let lower = target.join("agent.md");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&upper)
+            .unwrap();
+        let aliases = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lower)
+        {
+            Ok(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => true,
+            Err(error) => panic!("cannot probe target filename behavior: {error}"),
+        };
+        std::fs::remove_file(upper).unwrap();
+        if !aliases {
+            std::fs::remove_file(lower).unwrap();
+        }
+        aliases
+    }
+
+    #[test]
+    fn flat_probe_cleanup_preserves_unowned_stage_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("agents");
+        std::fs::create_dir(&target).unwrap();
+        let mut probe = FlatDestinationProbe::new(&target);
+        probe.prepare().unwrap();
+        let stage = probe.stage.as_ref().unwrap().clone();
+        let unowned = stage.join("unowned.md");
+        std::fs::write(&unowned, "# Keep\n").unwrap();
+
+        let error = probe.cleanup().unwrap_err();
+
+        assert!(error.to_string().contains(&stage.display().to_string()));
+        assert!(stage.exists());
+        assert_eq!(std::fs::read_to_string(&unowned).unwrap(), "# Keep\n");
+        std::fs::remove_file(&unowned).unwrap();
+        probe.cleanup().unwrap();
+        assert!(!stage.exists());
+    }
 
     // -----------------------------------------------------------------------
     // Fixture helpers — filesystem-only, no cross-crate function calls
@@ -3817,6 +4204,70 @@ mod tests {
             "# Local edit\n"
         );
         assert!(!cache.join("frontend/agent.md").exists());
+    }
+
+    #[test]
+    fn update_case_alias_restores_state_and_keeps_sync_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join(".claude/agents");
+        std::fs::create_dir_all(&target).unwrap();
+        if !target_aliases_case_names(&target) {
+            return;
+        }
+        write_update_collision_fixture(root);
+        let old_lock = std::fs::read(root.join("Skillfile.lock")).unwrap();
+        let cache = root.join(".skillfile/cache/agents/team");
+
+        let error = cmd_install_with_sync(
+            root,
+            &CmdInstallOpts {
+                dry_run: false,
+                update: true,
+                extra_targets: None,
+            },
+            || {
+                std::fs::create_dir_all(cache.join("frontend")).unwrap();
+                std::fs::write(cache.join("frontend/Agent.md"), "# Alias\n").unwrap();
+                write_lock_fixture(root, &update_collision_lock("new-sha"));
+                Err(SkillfileError::Network("HTTP 403 fetching notes".into()))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_case_alias_update_rollback(root, &old_lock, &error);
+    }
+
+    fn assert_case_alias_update_rollback(root: &Path, old_lock: &[u8], error: &str) {
+        let cache = root.join(".skillfile/cache/agents/team");
+        assert!(error.contains("backend/agent.md"), "{error}");
+        assert!(error.contains("frontend/Agent.md"), "{error}");
+        assert!(error.contains("HTTP 403 fetching notes"), "{error}");
+        assert_eq!(
+            std::fs::read(root.join("Skillfile.lock")).unwrap(),
+            old_lock
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                root.join(".skillfile/patches/agents/team/backend/agent.md.patch")
+            )
+            .unwrap(),
+            "old patch marker\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/agents/agent.md")).unwrap(),
+            "# Local edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.join("backend/agent.md")).unwrap(),
+            "# Old upstream\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.join(".meta")).unwrap(),
+            r#"{"sha":"old-sha"}"#
+        );
+        assert!(!cache.join("frontend/Agent.md").exists());
     }
 
     #[test]
