@@ -910,23 +910,17 @@ mod tests {
 
         assert!(error.contains("backend:agent.md"), "{error}");
         assert!(error.contains("frontend:agent.md"), "{error}");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(MANIFEST_NAME)).unwrap(),
-            manifest
-        );
-        assert!(!dir.path().join("Skillfile.lock").exists());
+        assert_failed_add_state(dir.path(), manifest);
         assert_eq!(std::fs::read_to_string(installed).unwrap(), "# Existing\n");
     }
 
     #[test]
-    fn add_rolls_back_when_agent_names_alias_on_target() {
+    fn add_uses_target_case_rules_and_preserves_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let target = root.join(".claude/agents");
         std::fs::create_dir_all(&target).unwrap();
-        if !target_aliases_case_names(&target) {
-            return;
-        }
+        let aliases = target_aliases_case_names(&target);
 
         let manifest = "install claude-code local\nlocal agent backend agents/backend\n";
         write_manifest(root, manifest);
@@ -939,17 +933,33 @@ mod tests {
         std::fs::write(&installed, "# Existing\n").unwrap();
         let entry = entry_from_local("agent", "agents/frontend", Some("frontend"));
 
-        let error = cmd_add(&entry, root).unwrap_err().to_string();
+        let result = cmd_add(&entry, root);
+        let updated_manifest = std::fs::read_to_string(root.join(MANIFEST_NAME)).unwrap();
+        if aliases {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("backend:Agent.md"), "{error}");
+            assert!(error.contains("frontend:agent.md"), "{error}");
+            assert_failed_add_state(root, manifest);
+        } else {
+            result.unwrap();
+            assert!(updated_manifest.contains("local  agent  agents/backend\n"));
+            assert!(updated_manifest.contains("local  agent  agents/frontend\n"));
+            assert_eq!(
+                std::fs::read_to_string(target.join("agent.md")).unwrap(),
+                "# frontend\n"
+            );
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 2);
+        }
+        assert_eq!(std::fs::read_to_string(installed).unwrap(), "# Existing\n");
+    }
 
-        assert!(error.contains("backend:Agent.md"), "{error}");
-        assert!(error.contains("frontend:agent.md"), "{error}");
+    fn assert_failed_add_state(root: &Path, manifest: &str) {
         assert_eq!(
             std::fs::read_to_string(root.join(MANIFEST_NAME)).unwrap(),
             manifest
         );
         assert!(!root.join("Skillfile.lock").exists());
         assert!(!root.join(".skillfile/cache/agents/frontend").exists());
-        assert_eq!(std::fs::read_to_string(installed).unwrap(), "# Existing\n");
     }
 
     // --- format_line direct tests ---

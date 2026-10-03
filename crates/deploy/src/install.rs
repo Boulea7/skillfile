@@ -1880,6 +1880,35 @@ mod tests {
         assert!(!stage.exists());
     }
 
+    #[test]
+    fn flat_probe_reports_both_sources_and_cleans_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("agents");
+        std::fs::create_dir(&target).unwrap();
+        let existing = target.join("existing.md");
+        std::fs::write(&existing, "# User content\n").unwrap();
+        let names = [
+            ("agent.md".into(), "frontend:agent.md".into()),
+            ("agent.md".into(), "backend:agent.md".into()),
+        ];
+
+        let error =
+            validate_actual_flat_names(&make_target("claude-code", Scope::Local), &target, &names)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("duplicate flat destination"), "{error}");
+        assert!(
+            error.contains(r#""agent.md" from ["backend:agent.md", "frontend:agent.md"]"#),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing).unwrap(),
+            "# User content\n"
+        );
+        assert_eq!(std::fs::read_dir(target).unwrap().count(), 1);
+    }
+
     // -----------------------------------------------------------------------
     // Fixture helpers — filesystem-only, no cross-crate function calls
     // -----------------------------------------------------------------------
@@ -4171,6 +4200,7 @@ mod tests {
         let old_lock = std::fs::read(root.join("Skillfile.lock")).unwrap();
         let cache = root.join(".skillfile/cache/agents/team");
         let patch = root.join(".skillfile/patches/agents/team/backend/agent.md.patch");
+        let mut synced = false;
 
         let error = cmd_install_with_sync(
             root,
@@ -4180,30 +4210,31 @@ mod tests {
                 extra_targets: None,
             },
             || {
+                assert_ne!(
+                    std::fs::read_to_string(&patch).unwrap(),
+                    "old patch marker\n"
+                );
+                std::fs::write(cache.join("backend/agent.md"), "# New upstream\n").unwrap();
                 std::fs::create_dir_all(cache.join("frontend")).unwrap();
                 std::fs::write(cache.join("frontend/agent.md"), "# Duplicate\n").unwrap();
+                std::fs::write(cache.join(".meta"), r#"{"sha":"new-sha"}"#).unwrap();
                 write_lock_fixture(root, &update_collision_lock("new-sha"));
+                assert_ne!(
+                    std::fs::read(root.join("Skillfile.lock")).unwrap(),
+                    old_lock
+                );
+                synced = true;
                 Err(SkillfileError::Network("HTTP 403 fetching notes".into()))
             },
         )
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("duplicate flat destination"), "{error}");
+        assert!(synced, "sync must change state before rollback");
+        assert!(error.contains("backend/agent.md"), "{error}");
+        assert!(error.contains("frontend/agent.md"), "{error}");
         assert!(error.contains("HTTP 403 fetching notes"), "{error}");
-        assert_eq!(
-            std::fs::read(root.join("Skillfile.lock")).unwrap(),
-            old_lock
-        );
-        assert_eq!(
-            std::fs::read_to_string(&patch).unwrap(),
-            "old patch marker\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join(".claude/agents/agent.md")).unwrap(),
-            "# Local edit\n"
-        );
-        assert!(!cache.join("frontend/agent.md").exists());
+        assert_update_collision_rollback(root, &old_lock, "agent.md");
     }
 
     #[test]
@@ -4236,14 +4267,14 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert_case_alias_update_rollback(root, &old_lock, &error);
-    }
-
-    fn assert_case_alias_update_rollback(root: &Path, old_lock: &[u8], error: &str) {
-        let cache = root.join(".skillfile/cache/agents/team");
         assert!(error.contains("backend/agent.md"), "{error}");
         assert!(error.contains("frontend/Agent.md"), "{error}");
         assert!(error.contains("HTTP 403 fetching notes"), "{error}");
+        assert_update_collision_rollback(root, &old_lock, "Agent.md");
+    }
+
+    fn assert_update_collision_rollback(root: &Path, old_lock: &[u8], new_name: &str) {
+        let cache = root.join(".skillfile/cache/agents/team");
         assert_eq!(
             std::fs::read(root.join("Skillfile.lock")).unwrap(),
             old_lock
@@ -4267,7 +4298,7 @@ mod tests {
             std::fs::read_to_string(cache.join(".meta")).unwrap(),
             r#"{"sha":"old-sha"}"#
         );
-        assert!(!cache.join("frontend/Agent.md").exists());
+        assert!(!cache.join("frontend").join(new_name).exists());
     }
 
     #[test]
