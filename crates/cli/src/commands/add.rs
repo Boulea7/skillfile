@@ -1228,6 +1228,17 @@ mod tests {
         assert!(!dir.path().join("Skillfile.lock").exists());
     }
 
+    fn assert_bulk_entries_retained(dir: &Path, names: &[&str]) {
+        let manifest = std::fs::read_to_string(dir.join(MANIFEST_NAME)).unwrap();
+        for name in names {
+            assert!(
+                manifest.contains(&format!("skills/{name}.md")),
+                "{manifest}"
+            );
+            assert!(dir.join(".skillfile/cache/skills").join(name).exists());
+        }
+    }
+
     #[test]
     fn bulk_add_continues_after_failure_and_preserves_successes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1252,17 +1263,7 @@ mod tests {
         let error = add_discovered_entries(&paths, &args, dir.path()).unwrap_err();
         assert!(error.to_string().contains("failed to add 1 selected skill"));
         let manifest = std::fs::read_to_string(dir.path().join(MANIFEST_NAME)).unwrap();
-        for name in ["alpha", "beta", "existing"] {
-            assert!(
-                manifest.contains(&format!("skills/{name}.md")),
-                "{manifest}"
-            );
-            assert!(dir
-                .path()
-                .join(".skillfile/cache/skills")
-                .join(name)
-                .exists());
-        }
+        assert_bulk_entries_retained(dir.path(), &["alpha", "beta", "existing"]);
         assert!(!manifest.contains("skills/blocked.md"), "{manifest}");
         assert!(target.join("alpha/SKILL.md").exists());
         assert!(target.join("beta/SKILL.md").exists());
